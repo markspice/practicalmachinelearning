@@ -1,0 +1,197 @@
+---
+output: html_document
+---
+
+##Predicting the quality of barbell lifts from accelerometer measurements
+
+```{r packages, echo = FALSE, warning = FALSE, message = FALSE, results = FALSE}
+
+##load add-on packages
+
+x <- c("knitr", "caret", "RANN", "randomForest", "ggplot2", "corrplot")
+lapply(x, require, character.only = TRUE)
+```
+```{r data, echo = FALSE, warning = FALSE, message = FALSE, results = FALSE, cache = TRUE}
+
+##load data
+
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", na.strings = c("NA","#DIV/0!"))
+testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", na.strings = c("NA","#DIV/0!"))
+```
+```{r seed}
+set.seed(1111)
+```
+
+###Overview
+The aim of this analysis is to build a machine learning algorithm that can successfully predict how well a person performs barbell lifts based on pitch, yaw, roll, acceleration, etc, measurements taken from accelerometers fitted to the participant's belt, forearm and arm and one attached to the barbell itself. The outcome of the lift is categorised as either correct (Class A) or is incorrect in one of five distinct ways (Classes B to E).
+
+Model building and selection will be based on a training dataset of 19,622 observations of 160 variables available from https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+The observations have been classified as follows:
+
+```{r outcome, echo = FALSE}
+t <-data.frame(table(training$classe))
+colnames(t) <- c("Class","Frequency")
+kable(t)
+```
+
+The chosen model will finally be used to predict the class for a separate sample of 20 observations: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The source data for this analysis comes from Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. "Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13)". Stuttgart, Germany: ACM SIGCHI, 2013.
+
+###Pre-processing
+The training dataset is initially partitioned into separate test and train datasets. 80% of the observations will be used for model specification with the remaining 20% used for validation of the models and final model selection.
+
+```{r dim1, echo = FALSE, cache = TRUE}
+inTrain = createDataPartition(training$classe, p = 0.8)[[1]]
+train = training[ inTrain,]
+test = training[-inTrain,]
+
+d <- rbind(dim(train),dim(test))
+rownames(d) <- c("train","test")
+colnames(d) <- c("obs","vars")
+kable(d)
+```
+
+The measurements from the four accelerometers are stored in variables 8 to 159 with the class in the final variable. The first seven variables are identifiers and timestamp data. As the exercise is to identify the outcome from the movements recorded by the accelerometers, these will be excluded from the model building.
+
+Many of the variables have either no variance or are almost entirely missing. Any variable with 0 variance or is populated for less than 5% of observations is also excluded as these be unlikely to add to the predictive power of the models. 
+
+The remaining missing values are to be imputed from near neighbours (kNNImpute)
+
+```{r removevars, cache = TRUE}
+incl <- sapply(train[,8:159], var, na.rm = TRUE) != 0 &
+        sapply(train[,8:159], function(x) mean(is.na(x))) <= 0.95
+v0 <- names(incl[incl == TRUE])
+train <- data.frame(classe = train$classe, subset(train, select = v0))
+```
+```{r removevarstable, echo = FALSE}
+t <- data.frame(obs = dim(train)[1], vars = dim(train)[2])
+rownames(t) <- "train"
+kable(t)
+```
+
+There also exists a high level of covariance between a number of the remaining variables as the correlation plot below demonstrates.
+
+```{r correlationplot, echo = FALSE}
+M <- cor(train[, -1])
+corrplot(M, order = "FPC", method = "color", type = "lower", 
+         tl.cex = 0.6, tl.col = rgb(0, 0, 0))
+```
+
+This includes 11 pairs of variables with absolute correlation in excess of 0.9.
+
+```{r correlationtable, echo = FALSE}
+M <- abs(cor(train[,-1]))
+diag(M) <- 0
+HC <- which(M > 0.9, arr.ind = TRUE)
+
+corrs <- data.frame()
+for (i in 1:dim(HC)[1]) {
+        c <- HC[i,2]
+        r <- HC[i,1]
+        if (r>c) {
+                corrs <- rbind(corrs, data.frame(Variable1 = colnames(M)[c], Variable2 = rownames(M)[r], Abs.Corr = M[r,c]))
+        } else {
+                corrs <- corrs
+        }
+}
+    
+kable(corrs[order(corrs$Abs.Corr, decreasing = TRUE),], row.names = FALSE, digits = 2)
+```
+
+The final train dataset is transformed using principal component analysis, resulting in a set of 25 independent variables that explain 95% of the variance in the train data.
+
+```{r preprocessing, cache = TRUE}
+preProc <- preProcess(train[,-1], method = c("knnImpute","pca"), thresh = 0.95)
+trainPC <- data.frame(classe = train$classe, predict(preProc, train[,-1]))
+```
+```{r preproctable, echo = FALSE}
+t <- data.frame(obs = dim(trainPC)[1], vars = dim(trainPC)[2])
+rownames(t) <- "trainPC"
+kable(t)
+```
+
+###Training
+
+Three different models are fitted:
+
+1.	Linear discriminant analysis
+2.	Random forests
+3.	Generalised boosted regression models
+
+For each model, the coefficients are estimated using three-fold cross-validation. A fourth model is then fitted based on the combined predictions of the three models. 
+
+```{r training, cache = TRUE}
+train_control <- trainControl(method="cv", number=3)
+modelLDA <- train(classe ~ ., data = trainPC, trControl = train_control, method = "lda")
+modelRF <- train(classe ~ ., data = trainPC, trControl = train_control, method = "rf")
+modelGBM <- train(classe ~ ., data = trainPC, trControl = train_control, method = "gbm", verbose = FALSE)
+
+cPredictionsLDA <- predict(modelLDA, newdata = trainPC)
+cPredictionsRF <- predict(modelRF, newdata = trainPC)
+cPredictionsGBM <- predict(modelGBM, newdata = trainPC)
+
+predDf.train <- data.frame(LDA=cPredictionsLDA, RF=cPredictionsRF, GBM=cPredictionsGBM, classe=trainPC$classe)
+modelComb <- randomForest(classe ~ ., data = predDf.train)
+
+cPredictionsComb <- predict(modelComb, newdata = predDf.train)
+```
+```{r trainingplot, echo = FALSE}
+acc <- data.frame(Method = c("1. LDA","2. RF","3. GBM","4. Combined"),
+                  rbind(confusionMatrix(cPredictionsLDA, train$classe)$overall,
+                        confusionMatrix(cPredictionsRF, train$classe)$overall,
+                        confusionMatrix(cPredictionsGBM, train$classe)$overall,
+                        confusionMatrix(cPredictionsComb, predDf.train$classe)$overall))
+ 
+ggplot(data.frame(acc), aes(x=Method, y=Accuracy)) +
+        ggtitle("Fitted prediction accuracy by method") +
+        geom_bar(stat="identity", fill="grey") +
+        geom_errorbar(aes(ymin = AccuracyLower, ymax = AccuracyUpper), width=0.6)
+```
+
+All three models outperform a random determination (20% accuracy). The random forest model correctly classifies all of the observations in the train data, compared to 86% for generalised boosted regression and 53% for linear determinant analysis. Whilst this suggests that the RF model could be the most successful, there is a serious risk of over-fitting.
+
+###Validation
+
+```{r validation, cache = TRUE}
+testPC <- data.frame(classe = test$classe, predict(preProc, subset(test, select = v0)))
+
+predictionsLDA <- predict(modelLDA, newdata = testPC)
+predictionsRF <- predict(modelRF, newdata = testPC)
+predictionsGBM <- predict(modelGBM, newdata = testPC)
+
+predDf.test <- data.frame(LDA=predictionsLDA, RF=predictionsRF, GBM=predictionsGBM, classe=testPC$classe)
+modelComb <- randomForest(classe ~ ., data = predDf.test)
+
+predictionsComb <- predict(modelComb, newdata = predDf.test)
+```
+
+Testing the models against the reserved test data, the random forest model is still the most successful with an out-of-sample error rate of less than 2.4%.
+
+```{r validationplot, echo = FALSE}
+acc <- data.frame(Method = c("1. LDA","2. RF","3. GBM","4. Combined"),
+                  rbind(confusionMatrix(predictionsLDA, test$classe)$overall,
+                        confusionMatrix(predictionsRF, test$classe)$overall,
+                        confusionMatrix(predictionsGBM, test$classe)$overall,
+                        confusionMatrix(predictionsComb, predDf.test$classe)$overall))
+acc$Error <- 1-acc$Accuracy
+
+ggplot(data.frame(acc), aes(x=Method, y=Accuracy)) +
+        ggtitle("Out-of-sample prediction accuracy by method") +
+        geom_bar(stat="identity", fill="grey") +
+        geom_errorbar(aes(ymin = AccuracyLower, ymax = AccuracyUpper), width=0.6)
+
+kable(acc[,c(1,2,9)])
+```
+
+###Predictions
+Using the random forest model derived above, the predictions for the 20 outcomes in the test dataset are as follows:
+
+```{r predictions, cache = TRUE}
+testingPC <- data.frame(predict(preProc, subset(testing, select = v0)))
+predictions <- predict(modelRF, newdata = testingPC)
+```
+```{r predictionstable, echo = FALSE}
+kable(data.frame(observation.1to10 = seq(1,10,1), prediction.1to10 = predictions[1:10],observation.11to20 = seq(11,20,1), prediction.11to20 = predictions[11:20]))
+```
+
